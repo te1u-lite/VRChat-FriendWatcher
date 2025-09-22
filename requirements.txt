@@ -1,0 +1,6 @@
+requests
+pyotp
+python-dotenv
+websocket-client
+win11toast
+vrchatapi
