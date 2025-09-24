@@ -1,6 +1,7 @@
 import logging
 import queue
 import os
+import threading
 from datetime import datetime
 from tkinter import messagebox, simpledialog
 
@@ -9,6 +10,7 @@ from dotenv import load_dotenv
 from core.logging_setup import setup_logging
 from core.vrc_client import VRChatClient, TwoFactorRequired, UserAgentRejected
 from gui.main_window import MainWindow, EVENT_LIST_UPDATE, EVENT_HEARTBEAT, EVENT_ERROR
+from core.watcher import WatcherThread
 
 APP_NAME = "VRChat-FriendWatcher"
 APP_VER = "0.1.0"
@@ -25,6 +27,9 @@ event_queue: queue.Queue | None = None
 # VRChatクライアント（開始後に生成）
 _vrc: VRChatClient | None = None
 log = logging.getLogger(__name__)
+
+_watcher: WatcherThread | None = None
+_stop_event: threading.Event | None = None
 
 
 def main():
@@ -99,10 +104,27 @@ def on_start(username: str, password: str, otp: str | None, interval: int):
         # 例外をそのまま投げると MainWindow 側で「開始失敗」のダイアログが出ます
         raise
 
+    global _watcher, _stop_event
+    _stop_event = threading.Event()
+    _watcher = WatcherThread(
+        vrc=_vrc,
+        interval_sec=interval,
+        event_queue=event_queue,
+        stop_event=_stop_event,
+        first_run_no_notify=True,
+    )
+    _watcher.start()
+
 
 def on_stop():
     """MainWindow から「停止」押下で呼ばれる。今は特に停止処理は無し。"""
-    log.info("停止要求を受け取りました（Watcher未実装のため何もしません）。")
+    global _watcher, _stop_event
+    if _stop_event is not None:
+        _stop_event.set()
+    if _watcher is not None and _watcher.is_alive():
+        _watcher.join(timeout=3.0)
+    _watcher = None
+    _stop_event = None
 
 
 if __name__ == "__main__":

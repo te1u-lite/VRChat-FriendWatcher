@@ -152,7 +152,7 @@ class MainWindow(tk.Tk):
         if self._on_start:
             # 実処理は外 (Watcher 起動など)
             username, password, otp = self.get_credentials()
-            interval = self.get_interval_sec
+            interval = self.get_interval_sec()
             try:
                 self._on_start(username, password, otp, interval)
                 self.set_running_ui(True)
