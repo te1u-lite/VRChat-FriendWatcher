@@ -1,10 +1,10 @@
-# core/vrc_client.py
 from __future__ import annotations
 
 import logging
 from typing import Optional, Dict, List
 
 from urllib3.exceptions import HTTPError
+from http.cookiejar import Cookie
 
 log = logging.getLogger(__name__)
 
@@ -193,3 +193,38 @@ class VRChatClient:
                 except Exception as e:
                     log.debug("%s 失敗: %s", name, e)
         return False
+
+    def get_auth_token(self) -> Optional[str]:
+        """
+        SDKが保持する Cookie から auth トークンを取り出す。
+        例: Cookie(name="auth", value="xxxxxxxx", domain=".vrchat.com" or "api.vrchat.cloud")
+        """
+        api = getattr(self, "_api", None)
+        if not api:
+            return None
+
+        # openapi-python-client の典型配置を両対応で探す
+        jar = getattr(api, "cookie_jar", None)
+        if jar is None:
+            rest = getattr(api, "rest_client", None)
+            jar = getattr(rest, "cookie_jar", None)
+
+        if not jar:
+            return None
+
+        for c in jar:
+            name = (c.name or "").lower()
+            if name in ("auth", "authtoken"):
+                return c.value
+        return None
+
+    def build_pipeline_ws_url(self, base: str = "wss://pipeline.vrchat.cloud/") -> Optional[str]:
+        """
+        旧来の形式: wss://pipeline.vrchat.cloud/?authToken=<token>
+        ※  実環境によっては base が wss://vrchat.com/...のこともあるので、
+            DevTools > Network > WS で確認して必要なら base を差し替えてください。
+        """
+        tok = self.get_auth_token()
+        if not tok:
+            return None
+        return f"{base}?authToken={tok}"
