@@ -128,18 +128,32 @@ class VRChatClient:
         if not self._authed or not self._friends:
             return []
 
-        friends = self._friends.get_friends()  # type: ignore
+        all_friends = []
+        offset = 0
+        page_size = 100
+        while True:
+            try:
+                page = self._friends.get_friends(n=page_size, offset=offset, offline=False)
+            except Exception as e:
+                log.debug("get_friends page fetch failed: %s", e)
+                break
+            if not page:
+                break
+            all_friends.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+
         online: List[Dict[str, str]] = []
-        for f in friends:
+        for f in all_friends:
             fid = getattr(f, "id", None)
             name = getattr(f, "display_name", None) or getattr(f, "username", None) or str(fid)
-            status = (getattr(f, "status", None) or getattr(f, "state", None) or "").lower()
-            location = (getattr(f, "location", None) or "").lower()
-
-            # ざっくり判定：status=online か、location が offline 以外ならオンライン扱い
+            status = (getattr(f, "status", None) or getattr(f, "state", None) or "")
+            status = status.lower() if isinstance(status, str) else ""
+            location = (getattr(f, "location", None) or "")
+            location = location.lower() if isinstance(location, str) else ""
             if status == "online" or (location and location != "offline"):
                 online.append({"id": str(fid), "name": str(name)})
-
         return online
 
     # ----------------- internal helpers -----------------

@@ -23,9 +23,9 @@ CUSTOM_UA = f"{APP_NAME}/{APP_VER} ({CONTACT})"
 # GUIオブジェクト/キューをコールバックから参照するためのグローバル
 app: MainWindow | None = None
 event_queue: queue.Queue | None = None
-
 # VRChatクライアント（開始後に生成）
 _vrc: VRChatClient | None = None
+
 log = logging.getLogger(__name__)
 
 # グローバル
@@ -46,7 +46,6 @@ def main():
 
     # GUI 構築 (on_start / on_stop を渡す)
     app = MainWindow(on_start=on_start, on_stop=on_stop)
-    # Watcher未実装でもイベントでUIを更新したいのでキューをつないでおく
     event_queue = queue.Queue()
     app.attach_event_queue(event_queue)
 
@@ -110,8 +109,6 @@ def on_start(username: str, password: str, otp: str | None, interval: int):
         event_queue.put((EVENT_ERROR, f"フレンド取得失敗：{e}"))
         # 例外をそのまま投げると MainWindow 側で「開始失敗」のダイアログが出ます
         raise
-
-    # まず一度だけRESTで即時更新
 
     # 停止イベント
     _stop_event = threading.Event()

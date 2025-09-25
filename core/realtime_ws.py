@@ -108,8 +108,9 @@ class WebSocketFriendSource(threading.Thread):
             try:
                 log.info("WS connecting: %s", mask_url(self.ws_cfg.url))
                 self._connect_and_loop()
-                # 通常終了 (stop要求など)
-                break
+                if self.stop_event.is_set():
+                    break
+                raise ConnectionError("WebSocket closed normalliy; will reconnect")
             except Exception as e:
                 if self.stop_event.is_set():
                     break
@@ -117,22 +118,22 @@ class WebSocketFriendSource(threading.Thread):
                 wait = min(backoff, self.ws_cfg.reconnect_max)
                 # ジッター
                 jitter = random.uniform(1-self.ws_cfg.jitter_ratio, 1+self.ws_cfg.jitter_ratio)
-                wait = wait*jitter
-                self._sleep_with_stop(wait)
+                self._sleep_with_stop(wait*jitter)
                 backoff = min(backoff * 2, self.ws_cfg.reconnect_max)
             log.info("WebSocketFriendSource stopped")
 
     # -------------------- internal --------------------
     def _connect_and_loop(self) -> None:
-        if not self.ws_cfg.url:
+        if not self.ws_cfg.url or "authToken=" not in self.ws_cfg.url:
             raise ValueError(
                 "WebSocket URL is empty. Provide WS_URL or ensure auth token could be extracted.")
-        headers_list = [f"{k}: {v}" for k, v in (self.ws_cfg.headers or {}).items()]
+        headers = dict(self.ws_cfg.headers or {})
+        headers.setdefault("User-Agent", "vrchatapi-python/1.0 (+https://vrchat.community)")
 
         # setup
         self._ws = websocket.WebSocketApp(
             self.ws_cfg.url,
-            header=[f"{k}: {v}" for k, v in self.ws_cfg.headers.items()],
+            header=[f"{k}: {v}" for k, v in headers.items()],
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
@@ -142,8 +143,6 @@ class WebSocketFriendSource(threading.Thread):
         kwargs = dict(
             ping_interval=self.ws_cfg.ping_interval,
             ping_timeout=self.ws_cfg.ping_timeout,
-            ping_payload="ping",
-            http_proxy_host=None,
         )
         if self.ws_cfg.origin:
             kwargs["origin"] = self.ws_cfg.origin
@@ -156,7 +155,7 @@ class WebSocketFriendSource(threading.Thread):
         self.q.put(("heartbeat", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
     def _on_close(self, ws, code, reason):
-        log.info("WS close: code=%S reason=%S", code, reason)
+        log.info("WS close: code=%s reason=%s", code, reason)
 
     def _on_error(self, ws, error):
         log.warning("WS error: %s", error)
@@ -170,42 +169,109 @@ class WebSocketFriendSource(threading.Thread):
             log.debug("Non-JSON message: %s", message[:200])
             return
 
-        # ---- ここで “VRChatの実メッセージ” に合わせて分岐する ----
-        ev_type = (data.get("type") or data.get("event") or "").lower()
+        # 文字列だけ来る(pong等) → 無視
+        if isinstance(data, str):
+            log.debug("WS string frame: %s", data[:200])
+            return
 
-        if ev_type in {"friend-online", "friend_online", "user-online"}:
-            uid = data.get("userId") or data.get("id")
-            name = data.get("displayName") or data.get("name") or uid
-            if uid:
-                self._known_names[uid] = str(name)
-                self._handle_online(uid)
+        # 配列で来ることがある → 要素ごとに処理
+        if isinstance(data, list):
+            for item in data:
+                self._handle_one_event(item)
+            return
 
-        elif ev_type in {"friend-offline", "friend_offline", "user-offline"}:
-            uid = data.get("userId") or data.get("id")
-            if uid:
-                self._handle_offline(uid)
+        # 通常の dict
+        if isinstance(data, dict):
+            self._handle_one_event(data)
+            return
 
-        # その他のイベントは心拍更新だけ
+        # それ以外はスキップ
+        log.debug("WS unknown type: %r", type(data))
+
+    def _handle_one_event(self, data: dict):
+        if not isinstance(data, dict):
+            return
+
+        ev_type = str(data.get("type") or data.get("event") or "").lower()
+        payload = data.get("content")
+
+        # content が文字列 (JSON文字列) で来る場合がある → 可能ならデコード
+        if isinstance(payload, str) and payload.lstrip().startswith(("{", "[")):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                pass
+
+        # 外側が "notification" のとき、内側の type で再判定
+        inner_type = None
+        if ev_type == "notification" and isinstance(payload, dict):
+            inner_type = str(payload.get("type") or "").lower()
+            # 二重エンコードでもう一段文字列のことがある
+            inner_content = payload.get("content")
+            if isinstance(inner_content, str) and inner_content.lstrip().startswith(("{", "[")):
+                try:
+                    inner_content = json.loads(inner_content)
+                except Exception:
+                    pass
+            if inner_content is not None:
+                payload = inner_content or payload
+
+        effective_type = inner_type or ev_type
+
+        def _uid_and_name(p: dict) -> tuple[Optional[str], Optional[str]]:
+            if not isinstance(p, dict):
+                return None, None
+            uid = p.get("userId") or p.get("userid") or p.get("id")
+            user = p.get("user") or {}
+            name = (
+                (user.get("displayName") if isinstance(user, dict) else None)
+                or p.get("displayName")
+                or p.get("username")
+                or p.get("name")
+            )
+            return uid, name
+
+        if effective_type in {"friend-online", "friend_active", "friend-active", "user-online", "friend-location"}:
+            # 配列で複数が一度に来る可能性も一応吸収
+            items = payload if isinstance(payload, list) else [payload]
+            for p in items:
+                uid, name = _uid_and_name(p)
+                if uid:
+                    if name:
+                        self._known_names[uid] = str(name)
+                    self._handle_online(uid)
+
+        elif effective_type in {"friend-offline", "friend_offline", "user-offline"}:
+            items = payload if isinstance(payload, list) else [payload]
+            for p in items:
+                uid, _ = _uid_and_name(p)
+                if uid:
+                    self._handle_offline(uid)
+
+        else:
+            # payload が dict とは限らないので keys() を呼ばない
+            log.debug("Unhandled event: %s", effective_type)
+
+        # 心拍 & バッファ吐きはここで
         self.q.put(("heartbeat", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-
-        # 必要なら束ねた list_update を適度な感覚で出す
         now = time.monotonic()
         if self._pending_changes and now - self._last_list_flush >= self.ws_cfg.list_flush_interval:
             self._flush_list_update()
-
-        # 定期的に REST で再同期 (名前・状態ズレ直し)
         if self.vrc and now >= self._next_resync_at:
             self._resync_with_rest()
             self._next_resync_at = now + self.ws_cfg.periodic_rest_resync_sec
 
     # ---- state updates ----
+
     def _handle_online(self, uid: str):
         if uid not in self._prev_online_ids:
             self._prev_online_ids.add(uid)
             self._pending_changes = True
             # 通知をレート制限
             if self._notify_bucket.allow(1):
-                self.q.put(("online_now"), [{"id": uid, "name": self._known_names.get(uid, uid)}])
+                name = self._known_names.get(uid, uid)
+                self.q.put(("online_now", [{"id": uid, "name": self._known_names.get(uid, uid)}]))
+                log.info("Friend online: %s (%s)", name, uid)
 
     def _handle_offline(self, uid: str):
         if uid in self._prev_online_ids:
