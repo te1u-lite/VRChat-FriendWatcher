@@ -12,6 +12,10 @@ EVENT_LIST_UPDATE = "list_update"    # payload: list[{"id","name"}]
 EVENT_HEARTBEAT = "heartbeat"        # payload: "YYYY-mm-dd HH:MM:SS"
 EVENT_ERROR = "error"                # payload: str
 
+EVENT_ONLINE = "online"
+EVENT_OFFLINE = "offline"
+EVENT_LOG = "log"
+
 
 class MainWindow(tk.Tk):
     """
@@ -27,13 +31,13 @@ class MainWindow(tk.Tk):
     def __init__(
             self,
             on_start: Optional[Callable[[
-                str, str, Optional[str], int], None]] = None,
+                str, str, Optional[str], int, str, str], None]] = None,
             on_stop: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__()
         self.title("VRChat Friend Watcher")
-        self.geometry("560x520")
-        self.minsize(520, 480)
+        self.geometry("600x560")
+        self.minsize(560, 520)
 
         # 外部注入のコールバック
         self._on_start = on_start
@@ -59,8 +63,6 @@ class MainWindow(tk.Tk):
         # レイアウトグリッドの伸縮
         for c in range(2):
             root.columnconfigure(c, weight=1)
-        # リスト部分の行だけ伸ばす
-        stretchy_row = 6
 
         row = 0
         ttk.Label(root, text="VRChat Username").grid(row=row, column=0, sticky="w")
@@ -78,41 +80,81 @@ class MainWindow(tk.Tk):
         self.ent_otp.grid(row=row, column=1, sticky="we")
         row += 1
 
+        # 監視方式
+        frm_mode = ttk.Frame(root)
+        frm_mode.grid(row=row, column=0, columnspan=2, pady=(6, 2), sticky="we")
+        self.var_mode = tk.StringVar(value="rest")  # "rest" or "ws"
+        ttk.Label(frm_mode, text="Mode").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        r1 = ttk.Radiobutton(frm_mode, text="REST (Polling)", value="rest",
+                             variable=self.var_mode, command=self._update_interval_state)
+        r2 = ttk.Radiobutton(frm_mode, text="WebSocket", value="ws",
+                             variable=self.var_mode, command=self._update_interval_state)
+        r1.grid(row=0, column=1, sticky="w")
+        r2.grid(row=0, column=2, sticky="w")
+        row += 1
+
+        # インターバル (REST時にのみ有効)
         ttk.Label(root, text="Interval (sec)").grid(row=row, column=0, sticky="w")
-        self.spin_interval = ttk.Spinbox(root, from_=10, to=600, increment=5, width=12)
+        self.spin_interval = ttk.Spinbox(root, from_=5, to=600, increment=5, width=12)
         self.spin_interval.set("30")
         self.spin_interval.grid(row=row, column=1, sticky="w")
         row += 1
 
+        # 対象フレンド
+        ttk.Label(root, text="Target Friends").grid(row=row, column=0, sticky="w")
+        self.cbo_target = ttk.Combobox(
+            root,
+            values=[
+                "All friends",
+                "Favorite Friends 1",
+                "Favorite Friends 2",
+                "Favorite Friends 3",
+                "Favorite Friends 4",
+            ],
+            state="readonly",
+        )
+        self.cbo_target.current(0)
+        self.cbo_target.grid(row=row, column=1, sticky="we")
+        self.cbo_target.bind("<<ComboboxSelected>>", self._on_target_changed)
+        row += 1
+
         # ボタン行
         btns = ttk.Frame(root)
-        btns.grid(row=row, column=0, columnspan=2, pady=(8, 4), sticky="we")
+        btns.grid(row=row, column=0, columnspan=2, pady=(8, 6), sticky="we")
         btns.columnconfigure(0, weight=1)
         btns.columnconfigure(1, weight=1)
+        btns.columnconfigure(2, weight=0)
 
         self.btn_start = ttk.Button(btns, text="開始", command=self._handle_start)
         self.btn_start.grid(row=0, column=0, padx=(0, 6), sticky="we")
         self.btn_stop = ttk.Button(btns, text="停止", command=self._handle_stop, state="disabled")
         self.btn_stop.grid(row=0, column=1, padx=(6, 0), sticky="we")
+        self.btn_clear = ttk.Button(btns, text="クリア", command=self._clear_log)
+        self.btn_clear.grid(row=0, column=2, sticky="e")
         row += 1
 
-        # 現在オンライン
-        header = ttk.Frame(root)
-        header.grid(row=row, column=0, columnspan=2, sticky="we")
-        header.columnconfigure(0, weight=1)
-        self.var_online_title = tk.StringVar(value="現在オンライン (0)")
-        ttk.Label(header, textvariable=self.var_online_title).grid(row=0, column=0, sticky="w")
+        # ログコンソール
+        ttk.Label(root, text="ログ").grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
-        self.list_online = tk.Listbox(root, height=14, activestyle="none")
-        self.list_online.grid(row=row, column=0, columnspan=2, sticky="nsew")
+        console_frame = ttk.Frame(root)
+        console_frame.grid(row=row, column=0, columnspan=2, sticky="nsew")
         root.rowconfigure(row, weight=1)
         row += 1
+
+        self.txt_log = tk.Text(console_frame, height=16, wrap="none", state="disabled")
+        yscroll = ttk.Scrollbar(console_frame, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=yscroll.set)
+        self.txt_log.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
 
         # ステータスバー
         self.var_status = tk.StringVar(value="未接続")
         status = ttk.Label(root, textvariable=self.var_status, anchor="w")
         status.grid(row=row, column=0, columnspan=2, sticky="we")
+
+        # 初期状態調整
+        self._update_interval_state()
 
     # ---------- 外部 API（Watcher/アプリ側から使う） ----------
     def attach_event_queue(self, q: queue.Queue) -> None:
@@ -141,7 +183,19 @@ class MainWindow(tk.Tk):
         except Exception:
             return 30
 
+    def get_mode(self) -> str:
+        return self.var_mode.get()  # "rest" or "ws"
+
+    def get_target_group(self) -> str:
+        idx = self.cbo_target.current()
+        return ["all", "fav1", "fav2", "fav3", "fav4"][idx]
+
     # ---------- 内部処理 ----------
+    def _update_interval_state(self) -> None:
+        # REST選択時のみ Interval を使えるように
+        state = "normal" if self.get_mode() == "rest" else "disabled"
+        self.spin_interval.config(state=state)
+
     def _handle_start(self) -> None:
         u, p, _ = self.get_credentials()
         if not u or not p:
@@ -153,8 +207,10 @@ class MainWindow(tk.Tk):
             # 実処理は外 (Watcher 起動など)
             username, password, otp = self.get_credentials()
             interval = self.get_interval_sec()
+            mode = self.get_mode()
+            tg = self.get_target_group()
             try:
-                self._on_start(username, password, otp, interval)
+                self._on_start(username, password, otp, interval, mode, tg)
                 self.set_running_ui(True)
                 self.var_status.set("監視中")
             except Exception as e:
@@ -182,6 +238,17 @@ class MainWindow(tk.Tk):
         finally:
             self.destroy()
 
+    def _clear_log(self) -> None:
+        self.txt_log.config(state="normal")
+        self.txt_log.delete("1.0", tk.END)
+        self.txt_log.config(state="disabled")
+
+    def _append_log(self, text: str) -> None:
+        self.txt_log.config(state="normal")
+        self.txt_log.insert(tk.END, text)
+        self.txt_log.see(tk.END)
+        self.txt_log.config(state="disabled")
+
     def _drain_queue(self) -> None:
         """Watcher からのイベントをUIに反映。Queue未設定でも安全にスキップ。"""
         q = self._event_queue
@@ -189,22 +256,49 @@ class MainWindow(tk.Tk):
             try:
                 while True:
                     kind, payload = q.get_nowait()
-                    if kind == EVENT_ONLINE_NOW:
-                        # 今は通知レイや未実装なので、ステータスに出すだけ
-                        names = ", ".join(f["name"] for f in payload)
-                        self.var_status.set(f"オンラインになった: {names}")
+
+                    if kind == EVENT_ONLINE:
+                        items = payload if isinstance(payload, list) else [payload]
+                        for f in items:
+                            self._append_log(
+                                f"[ONLINE] {f.get("name", "(unknown)")} ({f.get("id", "")})\n")
+                    elif kind == EVENT_OFFLINE:
+                        items = payload if isinstance(payload, list)else [payload]
+                        for f in items:
+                            self._append_log(
+                                f"[OFFLINE] {f.get("name", "(unknown)")} ({f.get("id", "")})\n")
+                    elif kind == EVENT_LOG:
+                        self._append_log(
+                            str(payload)+("\n" if not str(payload).endswith("\n")else ""))
+                    # 既存イベント
+                    elif kind == EVENT_ONLINE_NOW:
+                        names = ", ".join(f.get("name", "(unknown)")for f in payload)
+                        if names:
+                            self._append_log(f"[ONLINE] {names}\n")
                     elif kind == EVENT_LIST_UPDATE:
-                        self.list_online.delete(0, tk.END)
-                        for f in payload:
-                            self.list_online.insert(tk.END, f"{f["name"]}")
-                        self.var_online_title.set(f"現在オンライン ({len(payload)})")
+                        self._append_log("[INFO] list_update 受信 (ログUIでは非表示対象。必要なら実装を調整)\n")
                     elif kind == EVENT_HEARTBEAT:
                         self.var_status.set(f"最終更新: {payload}")
                     elif kind == EVENT_ERROR:
                         self.var_status.set(f"エラー: {payload}")
-                    # 未知イベントは無視
+                        self._append_log(f"[ERROR] {payload}\n")
+
             except queue.Empty:
                 pass
 
         # 500msごとにポーリング
         self.after(500, self._drain_queue)
+
+    def _on_target_changed(self, *_):
+        # 稼働中なら確認→再起動
+        running = (self.btn_stop["state"] == "normal")
+        if running and messagebox.askyesno("対象切り替え", "再ログインして対象を切り替えます。よろしいですか？"):
+            if self._on_stop:
+                self._on_stop()
+            if self._on_start:
+                u, p, otp = self.get_credentials()
+                interval = self.get_interval_sec()
+                mode = self.get_mode()
+                tg = self.get_target_group()
+                self._on_start(u, p, otp, interval, mode, tg)
+                self.set_running_ui(True)

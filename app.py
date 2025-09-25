@@ -10,7 +10,7 @@ from core.logging_setup import setup_logging
 from core.vrc_client import VRChatClient, TwoFactorRequired, UserAgentRejected
 from core.watcher import WatcherThread
 from core.realtime_ws import WebSocketFriendSource, WebSocketConfig
-from gui.main_window import MainWindow, EVENT_LIST_UPDATE, EVENT_HEARTBEAT, EVENT_ERROR
+from gui.main_window import MainWindow
 
 APP_NAME = "VRChat-FriendWatcher"
 APP_VER = "0.1.0"
@@ -52,7 +52,7 @@ def main():
     app.mainloop()
 
 
-def on_start(username: str, password: str, otp: str | None, interval: int):
+def on_start(username: str, password: str, otp: str | None, interval: int, mode: str, target_group: str) -> None:
     """
     MainWindow から「開始」押下で呼ばれる。
     1) パスワードだけで login_start()
@@ -61,6 +61,9 @@ def on_start(username: str, password: str, otp: str | None, interval: int):
     """
     global _vrc, app, event_queue, _watcher, _ws_thread, _stop_event
     assert app is not None and event_queue is not None
+
+    on_stop()
+
     interval = int(interval)
 
     _vrc = VRChatClient(user_agent=CUSTOM_UA)
@@ -97,24 +100,36 @@ def on_start(username: str, password: str, otp: str | None, interval: int):
                 raise RuntimeError("2FA検証に失敗しました。")
 
     # ここまで来たらログイン確定。オンライン一覧を1回だけ取得してUI更新
+    filter_ids = None
+    if target_group != "all":
+        gi = {"fav1": 1, "fav2": 2, "fav3": 3, "fav4": 4}.get(target_group, 1)
+        try:
+            ids = _vrc.fetch_favorite_friend_ids(gi)
+            filter_ids = ids or set()
+            log.info("Target group=%s, users=%d", target_group, len(filter_ids))
+        except Exception as e:
+            log.warning("お気に入り取得に失敗: %s (全件監視にフォールバック)", e)
+            filter_ids = None  # 失敗時は全件
+
+    # --- ここで一括ログ出力 (GUI側は "online" をリストでも受け付け可) ---
     try:
-        friends = _vrc.fetch_online_friends()
-        event_queue.put((EVENT_LIST_UPDATE, friends))
-        event_queue.put((EVENT_HEARTBEAT, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        log.info("オンライン: %d人", len(friends))
-        for f in friends:
-            log.info(" - %s (%s)", f["name"], f["id"])
+        initial = _vrc.fetch_online_friends(only_ids=filter_ids)
+        if initial:
+            event_queue.put(("online", initial))
     except Exception as e:
-        log.exception("フレンド取得に失敗: %s", e)
-        event_queue.put((EVENT_ERROR, f"フレンド取得失敗：{e}"))
-        # 例外をそのまま投げると MainWindow 側で「開始失敗」のダイアログが出ます
-        raise
+        log.warning("初回オンライン一括取得に失敗: %s", e)
+
+    # 起動時に一度だけ心拍・初期状態を反映 (ログ通知はウォッチャ/WSが行う)
+    try:
+        event_queue.put(("heartbeat", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    except Exception:
+        pass
 
     # 停止イベント
     _stop_event = threading.Event()
 
-    # ---- WebSocket モード ----
-    if USE_WS:
+    if mode == "ws":
+        # ---- WebSocket モード ----
         ws_url = os.getenv("WS_URL")
         headers = {"User-Agent": CUSTOM_UA}
 
@@ -153,7 +168,8 @@ def on_start(username: str, password: str, otp: str | None, interval: int):
             periodic_rest_resync_sec=300,
             origin=origin
         )
-        _ws_thread = WebSocketFriendSource(ws_cfg, event_queue, _stop_event, vrc=_vrc)
+        _ws_thread = WebSocketFriendSource(
+            ws_cfg, event_queue, _stop_event, vrc=_vrc, filter_ids=filter_ids, emit_legacy=False)
         _ws_thread.start()
         log.info("WebSocket mode started")
     else:
@@ -164,6 +180,7 @@ def on_start(username: str, password: str, otp: str | None, interval: int):
             event_queue=event_queue,
             stop_event=_stop_event,
             first_run_no_notify=True,
+            filter_ids=filter_ids,
         )
         _watcher.start()
         log.info("Polling mode started")

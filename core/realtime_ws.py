@@ -7,7 +7,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Set
 
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -17,6 +17,14 @@ import websocket
 from core.vrc_client import VRChatClient
 
 log = logging.getLogger(__name__)
+
+# ---- GUI と合わせたイベント名 ----
+EVENT_ONLINE = "online"
+EVENT_OFFLINE = "offline"
+EVENT_ONLINE_NOW = "online_now"
+EVENT_LIST_UPDATE = "list_update"
+EVENT_HEARTBEAT = "heartbeat"
+EVENT_ERROR = "error"
 
 
 def mask_url(url: str) -> str:
@@ -84,12 +92,16 @@ class WebSocketFriendSource(threading.Thread):
             event_queue: queue.Queue,
             stop_event: threading.Event,
             vrc: Optional[VRChatClient] = None,  # REST同期に使う (任意)
+            filter_ids: Optional[Set[str]] = None,
+            emit_legacy: bool = False,  # Trueなら online_now/list_update も出す
     ) -> None:
         super().__init__(daemon=True)
         self.ws_cfg = ws_cfg
         self.q = event_queue
         self.stop_event = stop_event
         self.vrc = vrc
+        self.filter_ids = set(filter_ids) if filter_ids else None
+        self.emit_legacy = emit_legacy
 
         self._ws: Optional[websocket.WebSocketApp] = None
         self._prev_online_ids: Set[str] = set()
@@ -97,8 +109,6 @@ class WebSocketFriendSource(threading.Thread):
         self._last_list_flush = 0.0
         self._notify_bucket = TokenBucket(ws_cfg.notify_rate_per_min)
         self._next_resync_at = time.monotonic() + ws_cfg.periodic_rest_resync_sec
-
-        # 受信側バッファ (短時間に多発する更新を束ねて list_update を抑制)
         self._pending_changes: bool = False
 
     # -------------------- public --------------------
@@ -120,7 +130,7 @@ class WebSocketFriendSource(threading.Thread):
                 jitter = random.uniform(1-self.ws_cfg.jitter_ratio, 1+self.ws_cfg.jitter_ratio)
                 self._sleep_with_stop(wait*jitter)
                 backoff = min(backoff * 2, self.ws_cfg.reconnect_max)
-            log.info("WebSocketFriendSource stopped")
+        log.info("WebSocketFriendSource stopped")
 
     # -------------------- internal --------------------
     def _connect_and_loop(self) -> None:
@@ -152,14 +162,23 @@ class WebSocketFriendSource(threading.Thread):
     # ---- WS callbacks ----
     def _on_open(self, ws):
         log.info("WS open")
-        self.q.put(("heartbeat", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        self.q.put((EVENT_HEARTBEAT, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        if self.vrc:
+            try:
+                friends = self.vrc.fetch_online_friends(only_ids=self.filter_ids)
+                for f in friends:
+                    uid = f["id"]
+                    self._prev_online_ids.add(uid)
+                    self.q.put((EVENT_ONLINE, f))
+            except Exception as e:
+                log.warning("WS open時の初期同期失敗: %s", e)
 
     def _on_close(self, ws, code, reason):
         log.info("WS close: code=%s reason=%s", code, reason)
 
     def _on_error(self, ws, error):
         log.warning("WS error: %s", error)
-        self.q.put(("error", f"WSエラー: {error}"))
+        self.q.put((EVENT_ERROR, f"WSエラー: {error}"))
 
     def _on_message(self, ws, message: str):
         try:
@@ -262,33 +281,42 @@ class WebSocketFriendSource(threading.Thread):
             self._next_resync_at = now + self.ws_cfg.periodic_rest_resync_sec
 
     # ---- state updates ----
+    def _is_target(self, uid: str) -> bool:
+        return (self.filter_ids is None) or (uid in self.filter_ids)
 
     def _handle_online(self, uid: str):
+        if not self._is_target(uid):
+            return
         if uid not in self._prev_online_ids:
             self._prev_online_ids.add(uid)
             self._pending_changes = True
+            name = self._known_names.get(uid, uid)
+            self.q.put((EVENT_ONLINE, {"id": uid, "name": name}))
             # 通知をレート制限
-            if self._notify_bucket.allow(1):
-                name = self._known_names.get(uid, uid)
-                self.q.put(("online_now", [{"id": uid, "name": self._known_names.get(uid, uid)}]))
-                log.info("Friend online: %s (%s)", name, uid)
+            if self.emit_legacy and self._notify_bucket.allow(1):
+                self.q.put((EVENT_ONLINE_NOW, [{"id": uid, "name": name}]))
 
     def _handle_offline(self, uid: str):
+        if not self._is_target(uid):
+            return
         if uid in self._prev_online_ids:
             self._prev_online_ids.remove(uid)
             self._pending_changes = True
-        # オフライン通知はノイズになりがちなので省略 (必要なら別イベントに)
+            name = self._known_names.get(uid, uid)
+            self.q.put((EVENT_OFFLINE, {"id": uid, "name": name}))
 
     def _flush_list_update(self):
         friends = [{"id": uid, "name": self._known_names.get(
             uid, uid)}for uid in sorted(self._prev_online_ids)]
-        self.q.put(("list_update", friends))
+        if self.emit_legacy:
+            self.q.put((EVENT_LIST_UPDATE, friends))
         self._last_list_flush = time.monotonic()
         self._pending_changes = False
 
     def _resync_with_rest(self):
         try:
-            friends = self.vrc.fetch_online_friends()  # [{"id","name"}]
+            friends = self.vrc.fetch_online_friends(
+                only_ids=self.filter_ids) if self.vrc else []  # [{"id","name"}]
             # セットで比較してズレ補正
             rest_ids = {f["id"] for f in friends}
             if rest_ids != self._prev_online_ids:

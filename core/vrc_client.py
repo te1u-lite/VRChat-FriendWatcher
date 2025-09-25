@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 
 from urllib3.exceptions import HTTPError
 from http.cookiejar import Cookie
@@ -11,6 +11,10 @@ log = logging.getLogger(__name__)
 try:
     from vrchatapi import ApiClient, Configuration
     from vrchatapi.api import authentication_api, friends_api
+    try:
+        from vrchatapi.api import favorites_api as favorites_api_mod
+    except Exception:
+        favorites_api_mod = None
     from vrchatapi.models.two_factor_email_code import TwoFactorEmailCode
     from vrchatapi.models.two_factor_auth_code import TwoFactorAuthCode
     from vrchatapi.exceptions import UnauthorizedException, ApiException
@@ -47,6 +51,13 @@ class DnsResolutionFailed(RuntimeError):
     """DNS で api.vrchat.cloud を解決できなかった"""
 
 
+def _get_any(obj, names, default=None):
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    return default
+
+
 class VRChatClient:
     """
     まずメールコードを検証し、ダメならTOTPを試す最小実装。
@@ -67,6 +78,7 @@ class VRChatClient:
         self._api: Optional[ApiClient] = None
         self._auth: Optional[authentication_api.AuthenticationApi] = None  # type: ignore
         self._friends: Optional[friends_api.FriendsApi] = None  # type: ignore
+        self._favorites = None
         self._authed: bool = False
 
     def is_authed(self) -> bool:
@@ -101,7 +113,6 @@ class VRChatClient:
                 raise UserAgentRejected("WAF により UA 不備として拒否されました。")from e
             if status in (401, 200) or "2fa" in body.lower():
                 raise TwoFactorRequired("2FA が必要です。")from e
-            # 想定外はそのまま上げる
             raise
 
     # ---------- 段階2: コード提出（まずメール→だめならTOTP） ----------
@@ -123,7 +134,7 @@ class VRChatClient:
         return False
 
     # ----------------- Friends -----------------
-    def fetch_online_friends(self) -> List[Dict[str, str]]:
+    def fetch_online_friends(self, only_ids: Optional[Set[str]] = None) -> List[Dict[str, str]]:
         """オンラインのフレンドだけ [{'id','name'}] を返す（簡易判定）"""
         if not self._authed or not self._friends:
             return []
@@ -152,11 +163,72 @@ class VRChatClient:
             status = status.lower() if isinstance(status, str) else ""
             location = (getattr(f, "location", None) or "")
             location = location.lower() if isinstance(location, str) else ""
-            if status == "online" or (location and location != "offline"):
-                online.append({"id": str(fid), "name": str(name)})
+            is_online = (status == "online") or (location and location != "offline")
+            if is_online:
+                if only_ids is None or (fid and str(fid) in only_ids):
+                    online.append({"id": str(fid), "name": str(name)})
         return online
 
+    # ----------------- Favorites（お気に入りフレンド） -----------------
+    def fetch_favorite_friend_ids(self, group_index: int) -> set[str]:
+        """
+        Favorite Friends 1~4 のいずれかに所属するフレンドの ID 集合を返す。
+        group_index: 1..4
+        ※ SDKの版によりプロパティ名が揺れるため動的に吸収。
+        """
+        ids: Set[str] = set()
+        if not self._authed or not favorites_api_mod:
+            if not favorites_api_mod:
+                log.warning("FavoritesApi が見つかりません (SDKバージョン要確認) 。空集合を返します。")
+                return ids
+
+        if self._favorites is None:
+            try:
+                self._favorites = favorites_api_mod.FavoritesApi(self._api)
+            except Exception as e:
+                log.warning("FavoritesApi 初期化失敗: %s", e)
+                return ids
+
+        def _tag_matches_group(tag: str, gi: int) -> bool:
+            t = (tag or "").lower()
+            return any([
+                f"group_{gi-1}" in t,
+                f"favorite_friends_{gi}" in t,
+                f"favorite-friends-{gi}" in t,
+                (("friend" in t or "friends" in t) and "favorite" in t and str(gi) in t),
+            ])
+
+        offset = 0
+        page_size = 100
+        while True:
+            try:
+                page = self._favorites.get_favorites(n=page_size, offset=offset, type="friend")
+            except Exception as e:
+                log.debug("get_favorites 失敗: %s", e)
+                break
+            if not page:
+                break
+
+            for fav in page:
+                tags = _get_any(fav, ["tags"], []) or []
+                if any(_tag_matches_group(t, group_index)for t in tags):
+                    # フレンド本体のID (favorite対象ID) を取り出す
+                    fid = _get_any(fav, ["favorite_id", "favoriteId",
+                                   "object_id", "objectId", "target_id", "targetId"])
+                    # 万一上記が取れない版では "id" が対象IDのことも (そうでないことも) あるため最終手段に
+                    if not fid:
+                        fid = getattr(fav, "id", None)
+                    if fid:
+                        ids.add(str(fid))
+
+            if len(page) < page_size:
+                break
+            offset += page_size
+        log.info("Favorite Friends %d: %d users", group_index, len(ids))
+        return ids
+
     # ----------------- internal helpers -----------------
+
     def _finalize_auth(self) -> None:
         self._friends = friends_api.FriendsApi(self._api)
         self._authed = True

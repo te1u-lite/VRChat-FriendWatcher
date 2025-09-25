@@ -5,11 +5,16 @@ import queue
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Set
+from typing import Dict, Optional, Set
 
 from core.vrc_client import VRChatClient
 
 log = logging.getLogger(__name__)
+
+EVENT_ONLINE = "online"
+EVENT_OFFLINE = "offline"
+EVENT_HEARTBEAT = "heartbeat"
+EVENT_ERROR = "error"
 
 
 class WatcherThread(threading.Thread):
@@ -30,65 +35,45 @@ class WatcherThread(threading.Thread):
             event_queue: queue.Queue,
             stop_event: threading.Event,
             first_run_no_notify: bool = True,   # 初回は通知しない (スパム防止)
+            filter_ids: Optional[Set[str]] = None,
     ) -> None:
         super().__init__(daemon=True)
         self.vrc = vrc
         self.interval = max(5, int(interval_sec))
         self.q = event_queue
         self.stop_event = stop_event
-        self.first_run = True
         self.first_run_no_notify = first_run_no_notify
-        self.prev_online_ids: Set[str] = set()
-
-        # 失敗時の指数バックオフ
-        self._backoff = 1
-        self._backoff_max = 60
+        self.filter_ids = set(filter_ids) if filter_ids else None
+        self._online_prev: Set[str] = set()
+        self._name_cache: Dict[str, str] = {}
 
     def run(self) -> None:
-        log.info("WatcherThread started (interval=%ss)", self.interval)
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    friends: List[Dict[str, str]] = self.vrc.fetch_online_friends()
-                    now_ids = {f["id"]for f in friends}
+        suppress = self.first_run_no_notify
+        while not self.stop_event.is_set():
+            try:
+                friends = self.vrc.fetch_online_friends(only_ids=self.filter_ids)
+                now_ids = {f["id"]for f in friends}
+                for f in friends:
+                    self._name_cache[f["id"]] = f["name"]
 
-                    # 新規オンライン検知
-                    if self.first_run and self.first_run_no_notify:
-                        newly_online = []
-                    else:
-                        newly_online_ids = now_ids - self.prev_online_ids
-                        newly_online = [f for f in friends if f["id"] in newly_online_ids]
+                if not suppress:
+                    new_online = now_ids - self._online_prev
+                    new_off = self._online_prev - now_ids
+                    for uid in sorted(new_online):
+                        self.q.put(
+                            (EVENT_ONLINE, {"id": uid, "name": self._name_cache.get(uid, uid)}))
+                    for uid in sorted(new_off):
+                        self.q.put(
+                            (EVENT_OFFLINE, {"id": uid, "name": self._name_cache.get(uid, uid)}))
 
-                    # イベント出力
-                    if newly_online:
-                        self.q.put(("online_now", newly_online))
-                        for f in newly_online:
-                            log.info("%s がオンラインになりました", f["name"])
+                self._online_prev = now_ids
+                self.q.put((EVENT_HEARTBEAT, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                suppress = False
+            except Exception as e:
+                log.warning("Polling failed: %s", e)
+                self.q.put((EVENT_ERROR, f"RESTポーリング失敗: {e}"))
 
-                    self.q.put(("list_update", friends))
-                    self.q.put(("heartbeat", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-
-                    # 状態更新・バックオフリセット
-                    self.prev_online_ids = now_ids
-                    self.first_run = False
-                    self._backoff = 1
-
-                    # 通常スリープ
-                    self._sleep_with_stop(self.interval)
-
-                except Exception as e:
-                    log.exception("Watcher loop error: %s", e)
-                    self.q.put(("error", f"監視エラー: {e}"))
-                    # バックオフして再試行
-                    wait = min(self._backoff, self._backoff_max)
-                    self._backoff = min(self._backoff*2, self._backoff_max)
-                    self._sleep_with_stop(wait)
-
-        finally:
-            log.info("WatcherThread stopped")
-
-    def _sleep_with_stop(self, seconds: int) -> None:
-        """停止指示に素早く反応できるよう、短い刻みで眠る。"""
-        deadline = time.time()+seconds
-        while not self.stop_event.is_set() and time.time() < deadline:
-            time.sleep(0.5)
+            # スリープ (停止要求をチェックしながら)
+            end = time.time() + self.interval
+            while not self.stop_event.is_set() and time.time() < end:
+                time.sleep(0.2)
