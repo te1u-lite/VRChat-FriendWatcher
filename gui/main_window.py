@@ -148,6 +148,10 @@ class MainWindow(tk.Tk):
         self.txt_log.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
 
+        self.txt_log.tag_configure("online", foreground="green")
+        self.txt_log.tag_configure("offline", foreground="red")
+        self.txt_log.tag_configure("eeror", foreground="orange red")
+
         # ステータスバー
         self.var_status = tk.StringVar(value="未接続")
         status = ttk.Label(root, textvariable=self.var_status, anchor="w")
@@ -243,9 +247,12 @@ class MainWindow(tk.Tk):
         self.txt_log.delete("1.0", tk.END)
         self.txt_log.config(state="disabled")
 
-    def _append_log(self, text: str) -> None:
+    def _append_log(self, text: str, tag: Optional[str] = None) -> None:
         self.txt_log.config(state="normal")
-        self.txt_log.insert(tk.END, text)
+        if tag:
+            self.txt_log.insert(tk.END, text, tag)
+        else:
+            self.txt_log.insert(tk.END, text)
         self.txt_log.see(tk.END)
         self.txt_log.config(state="disabled")
 
@@ -261,12 +268,12 @@ class MainWindow(tk.Tk):
                         items = payload if isinstance(payload, list) else [payload]
                         for f in items:
                             self._append_log(
-                                f"[ONLINE] {f.get("name", "(unknown)")} ({f.get("id", "")})\n")
+                                f"[ONLINE] {f.get("name", "(unknown)")} ({f.get("id", "")})\n", "online")
                     elif kind == EVENT_OFFLINE:
                         items = payload if isinstance(payload, list)else [payload]
                         for f in items:
                             self._append_log(
-                                f"[OFFLINE] {f.get("name", "(unknown)")} ({f.get("id", "")})\n")
+                                f"[OFFLINE] {f.get("name", "(unknown)")} ({f.get("id", "")})\n", "offline")
                     elif kind == EVENT_LOG:
                         self._append_log(
                             str(payload)+("\n" if not str(payload).endswith("\n")else ""))
@@ -281,7 +288,7 @@ class MainWindow(tk.Tk):
                         self.var_status.set(f"最終更新: {payload}")
                     elif kind == EVENT_ERROR:
                         self.var_status.set(f"エラー: {payload}")
-                        self._append_log(f"[ERROR] {payload}\n")
+                        self._append_log(f"[ERROR] {payload}\n", "eeror")
 
             except queue.Empty:
                 pass
