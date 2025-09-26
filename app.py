@@ -2,9 +2,10 @@ import logging
 import queue
 import os
 import threading
+from pathlib import Path
 from datetime import datetime
 from tkinter import messagebox, simpledialog
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv, set_key
 
 from core.logging_setup import setup_logging
 from core.vrc_client import VRChatClient, TwoFactorRequired, UserAgentRejected
@@ -16,6 +17,14 @@ APP_NAME = "VRChat-FriendWatcher"
 APP_VER = "0.1.0"
 
 load_dotenv()
+
+# .env の場所を特定 (なければカレント直下に作る)
+ENV_FILE = find_dotenv(usecwd=True) or str(Path.cwd()/".env")
+
+# セッションCookie保存先 (前の提案と同じにしておくと吉)
+CFG_DIR = Path(os.getenv("VRCWATCHER_HOME") or (Path.home()/".vrcwatcher"))
+CFG_DIR.mkdir(parents=True, exist_ok=True)
+COOKIE_PATH = str(CFG_DIR / "session.json")
 
 CONTACT = os.getenv("CONTACT_EMAIL") or "unknown@example.com"
 CUSTOM_UA = f"{APP_NAME}/{APP_VER} ({CONTACT})"
@@ -49,6 +58,15 @@ def main():
     event_queue = queue.Queue()
     app.attach_event_queue(event_queue)
 
+    load_dotenv(ENV_FILE)
+    u = os.getenv("VRC_USERNAME") or ""
+    p = os.getenv("VRC_PASSWORD") or ""
+
+    if u:
+        app.ent_user.insert(0, u)
+    if p:
+        app.ent_pass.insert(0, p)
+
     app.mainloop()
 
 
@@ -65,39 +83,74 @@ def on_start(username: str, password: str, otp: str | None, interval: int, mode:
     on_stop()
 
     interval = int(interval)
-
     _vrc = VRChatClient(user_agent=CUSTOM_UA)
 
-    # まずPWだけで試行 (ここで2FA判定/メール送信まで進む)
+    # 1) セッション (Cookie) 復元を最優先。成功すればOTP不要
+    resumed = False
     try:
-        if _vrc.login_start(username, password):
-            log.info("ログイン成功 (2FA不要) ")
-        else:
-            raise RuntimeError("不明な理由でログインに失敗しました。")
-    except UserAgentRejected as e:
-        # UA不備 → コード入力に進ませない
-        messagebox.showerror(
-            "User-Agent エラー",
-            f"User-Agent が不十分なため403で拒否されました。\n\n"
-            f"現在のUA:\n{CUSTOM_UA}\n\n{e}\n"
-            "UAは「アプリ名/バージョン (連絡先)」形式にしてください。"
-        )
-        raise
-    except TwoFactorRequired:
-        # 2FAが必要。GUIのOTP欄に入っていればそれを先に使用、なければダイアログで取得
-        code = (otp or "").strip() or simpledialog.askstring(
-            "2FAコード",
-            "メールで届いた6桁コード、またはTOTP を入力してください:",
-            parent=app,
-        )
-        if not code:
-            raise RuntimeError("2FAコードが入力されませんでした。")
+        resumed = _vrc.load_cookies(COOKIE_PATH)
+        log.info("resume=%s cookie_file=%s exists=%s", resumed,
+                 COOKIE_PATH, os.path.exists(COOKIE_PATH))
+    except Exception as e:
+        log.warning("Cookie読み込み失敗: %s", e)
+        resumed = False
 
-        # 1回目失敗時は再入力を促す
-        if not _vrc.submit_code(code):
-            code2 = simpledialog.askstring("再入力", "コードが無効/期限切れです。もう一度入力してください：", parent=app)
-            if not code2 or not _vrc.submit_code(code2.strip()):
-                raise RuntimeError("2FA検証に失敗しました。")
+    if not resumed:
+        # 2) GUI未入力 なら .env から補間
+        if not username:
+            username = os.getenv("VRC_USERNAME") or ""
+        if not password:
+            password = os.getenv("VRC_PASSWORD") or ""
+
+        if not username or not password:
+            raise RuntimeError(
+                "ユーザー名/パスワードが未入力 (.env に VRC_USERNAME / VRC_PASSWORD を設定するか、GUIに入力してください)")
+
+        # 3) 通常ログイン (必要ならOTP)
+        try:
+            if _vrc.login_start(username, password):
+                log.info("ログイン成功 (2FA不要) ")
+            else:
+                raise RuntimeError("不明な理由でログインに失敗しました。")
+        except UserAgentRejected as e:
+            # UA不備 → コード入力に進ませない
+            messagebox.showerror(
+                "User-Agent エラー",
+                f"User-Agent が不十分なため403で拒否されました。\n\n"
+                f"現在のUA:\n{CUSTOM_UA}\n\n{e}\n"
+                "UAは「アプリ名/バージョン (連絡先)」形式にしてください。"
+            )
+            raise
+        except TwoFactorRequired:
+            # 2FAが必要。GUIのOTP欄に入っていればそれを先に使用、なければダイアログで取得
+            code = (otp or "").strip() or simpledialog.askstring(
+                "2FAコード",
+                "メールで届いた6桁コード、またはTOTP を入力してください:",
+                parent=app,
+            )
+            if not code:
+                raise RuntimeError("2FAコードが入力されませんでした。")
+
+            # 1回目失敗時は再入力を促す
+            if not _vrc.submit_code(code):
+                code2 = simpledialog.askstring("再入力", "コードが無効/期限切れです。もう一度入力してください：", parent=app)
+                if not code2 or not _vrc.submit_code(code2.strip()):
+                    raise RuntimeError("2FA検証に失敗しました。")
+
+        # 4) ログイン成功 → Cookie保存 & .env に資格情報を保存
+        try:
+            _vrc.save_cookies(COOKIE_PATH)
+        except Exception as e:
+            log.warning("Cookie 保存失敗: %s", e)
+
+        try:
+            set_key(ENV_FILE, "VRC_USERNAME", username)
+            set_key(ENV_FILE, "VRC_PASSWORD", password)
+            log.info("資格情報を .env に保存しました: %s", ENV_FILE)
+        except Exception as e:
+            log.warning(".env への保存失敗: %s", e)
+    else:
+        log.info("セッション再開ログイン成功 (OTP不要)")
 
     # ここまで来たらログイン確定。オンライン一覧を1回だけ取得してUI更新
     filter_ids = None

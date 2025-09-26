@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import time
+import json
 import logging
 from typing import Optional, Dict, List, Set
 
@@ -21,6 +24,42 @@ try:
     HAS_SDK = True
 except Exception:
     HAS_SDK = False
+
+
+def _cookie_to_dict(c: Cookie) -> dict:
+    return {
+        "version": c.version, "name": c.name, "value": c.value,
+        "port": c.port, "port_specified": c.port_specified,
+        "domain": c.domain, "domain_specified": c.domain_specified,
+        "domain_initial_dot": c.domain_initial_dot,
+        "path": c.path, "path_specified": c.path_specified,
+        "secure": c.secure, "expires": c.expires,
+        "discard": c.discard, "comment": c.comment, "comment_url": c.comment_url,
+        "rest": getattr(c, "_rest", {}), "rfc2109": c.rfc2109
+    }
+
+
+def _dict_to_cookie(d: dict) -> Cookie:
+    return Cookie(
+        version=d.get("version", 0), name=d["name"], value=d["value"],
+        port=d.get("port"), port_specified=d.get("port_specified", False),
+        domain=d.get("domain", ""), domain_specified=d.get("domain_specified", False),
+        domain_initial_dot=d.get("domain_initial_dot", False),
+        path=d.get("path", "/"), path_specified=d.get("path_specified", True),
+        secure=d.get("secure", False), expires=d.get("expires"),
+        discard=d.get("discard", True), comment=d.get("comment"),
+        comment_url=d.get("comment_url"), rest=d.get("rest", {}), rfc2109=d.get("rfc2109", False)
+    )
+
+
+def _get_cookie_jar(api) -> Optional[object]:
+    if not api:
+        return None
+    jar = getattr(api, "cookie_jar", None)
+    if jar is None:
+        rest = getattr(api, "rest_client", None)
+        jar = getattr(rest, "cookie_jar", None)
+    return jar
 
 
 class HttpStatus(RuntimeError):
@@ -118,20 +157,71 @@ class VRChatClient:
     # ---------- 段階2: コード提出（まずメール→だめならTOTP） ----------
 
     def submit_code(self, code: str) -> bool:
-        if not code:
+        if not code or not self._auth:
             return False
-        # 1) メールコードとして検証
-        if self._try_verify_email_code(code) and self._try_get_current_user():
-            self._finalize_auth()
-            log.info("メールコード認証")
+        code = code.strip()
+
+        # 1) まずメールコード (6桁想定) を優先して試す
+        if self._verify_email_code_fallback(code) and self._post_2fa_fixup():
+            log.info("メールコード認証成功")
             return True
-        # 2) TOTPとして検証
-        if self._try_verify_totp(code) and self._try_get_current_user():
-            self._finalize_auth()
-            log.info("TOTP認証成功")
+
+        # 2) ダメなら TOTP として試す
+        if self._verify_totp_fallback(code) and self._post_2fa_fixup():
+            log.info("TOTP 認証成功")
             return True
-        log.error("コード検証に失敗しました (不一致/期限切れの可能性)")
+
+        log.error("2FAコード検証に失敗 (不一致/期限切れ/SDKメソッド不整合の可能性)")
         return False
+
+    def _verify_email_code_fallback(self, code: str) -> bool:
+        try:
+            payload = TwoFactorEmailCode(code=code)
+        except Exception:
+            payload = {"code": code}  # モデル未一致版に保険
+
+        candidates = [
+            ("verify2_fa_email_code", {"two_factor_email_code": payload}),
+            ("verify_two_factor_email_code", {"two_factor_email_code": payload}),
+            ("verify2_fa_email_code", {"two_factor_email_code": {"code": code}}),
+            ("verify_two_factor_email_code", {"two_factor_email_code": {"code": code}}),
+        ]
+        return self._try_methods(self._auth, candidates)
+
+    def _verify_totp_fallback(self, code: str) -> bool:
+        try:
+            payload = TwoFactorAuthCode(code=code)
+        except Exception:
+            payload = {"code": code}
+
+        candidates = [
+            ("verify2_fa", {"two_factor_auth_code": payload}),
+            ("verify_two_factor", {"two_factor_auth_code": payload}),
+            ("verify2_fa", {"two_factor_auth_code": {"code": code}}),
+            ("verify_two_factor", {"two_factor_auth_code": {"code": code}}),
+        ]
+        return self._try_methods(self._auth, candidates)
+
+    # --- 新規: 2FA 成功後に「本当にセッション確立しているか」を確定させる ---
+    def _post_2fa_fixup(self) -> bool:
+        """
+        2FA検証後にセッションが確立しているかを二重に確認:
+        1) get_current_user() が成功するか
+        2) CookieJar に 'auth' / 'authtoken' が存在するか
+        OKなら finalize_auth() 済みで True
+        """
+        # まず current_user で 200 を確認
+        if not self._try_get_current_user():
+            return False
+
+        # Cookie に auth が入っているかを確認
+        tok = self.get_auth_token()
+        if not tok:
+            log.debug("2FA後に auth cookie が見つかりません")
+            return False
+
+        self._finalize_auth()
+        return True
 
     # ----------------- Friends -----------------
     def fetch_online_friends(self, only_ids: Optional[Set[str]] = None) -> List[Dict[str, str]]:
@@ -314,3 +404,146 @@ class VRChatClient:
         if not tok:
             return None
         return f"{base}?authToken={tok}"
+
+    def load_cookies(self, path: str) -> bool:
+        if not os.path.exists(path):
+            log.info("Cookie file not found: %s", path)
+            return False
+        try:
+            obj = json.loads(open(path, "r", encoding="utf-8").read())
+            cookies = obj.get("cookies", [])
+        except Exception as e:
+            log.warning("Cookie file read failed: %s", e)
+            return False
+
+        # ApiClient 準備 + UA を必ず入れる（WAF回避に必須）
+        self._api = ApiClient(self._conf)
+        try:
+            self._api.set_default_header("User-Agent", self._conf.user_agent)
+        except AttributeError:
+            if hasattr(self._api, "default_headers"):
+                self._api.default_headers["User-Agent"] = self._conf.user_agent
+
+        jar = _get_cookie_jar(self._api)
+        if not jar:
+            log.warning("No cookie jar on ApiClient")
+            return False
+        try:
+            # いったん既存をクリア（安全のため例外を握りつぶす）
+            jar.clear()
+        except Exception:
+            pass
+
+        # ユーティリティ：同一 cookie が jar に存在するか判定
+        def jar_has_cookie(name, domain, value):
+            for cc in jar:
+                try:
+                    if (getattr(cc, "name", "").lower() == (name or "").lower() and
+                        getattr(cc, "domain", "") == domain and
+                            getattr(cc, "value", None) == value):
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        has_auth = False
+        # 読み込んだ cookie を入れていく（domain が無い等のケースに耐える）
+        for d in cookies:
+            try:
+                # ドメインが無い/空の場合はAPIドメインをデフォルトとする
+                dom = d.get("domain") or "api.vrchat.cloud"
+                d_copy = dict(d)
+                d_copy["domain"] = dom
+                c = _dict_to_cookie(d_copy)
+                if not jar_has_cookie(c.name, c.domain, c.value):
+                    jar.set_cookie(c)
+                if (c.name or "").lower() in ("auth", "authtoken") and c.value:
+                    has_auth = True
+            except Exception as e:
+                log.debug("set_cookie failed (skipped): %s", e)
+
+        if not has_auth:
+            log.info("Cookie file has no 'auth'/'authtoken'; cannot resume.")
+            return False
+
+        # ドメイン不一致対策：auth を必要ドメインに複製（ただし重複は作らない）
+        try:
+            from http.cookiejar import Cookie
+            wanted = {"api.vrchat.cloud", ".vrchat.com", "vrchat.com"}
+
+            def ensure_cookie(name: str):
+                # jar内の同名クッキーの値を収集（複数可）
+                values = [
+                    c.value for c in jar
+                    if getattr(c, "name", "").lower() == name.lower() and c.value
+                ]
+                for value in values:
+                    for dom in wanted:
+                        exists = any(
+                            (getattr(cc, "name", "").lower() == name.lower()
+                             and getattr(cc, "domain", "") == dom
+                             and getattr(cc, "value", None) == value)
+                            for cc in jar
+                        )
+                        if exists:
+                            continue
+                        dup = Cookie(
+                            version=0, name=name, value=value,
+                            port=None, port_specified=False,
+                            domain=dom, domain_specified=True,
+                            domain_initial_dot=dom.startswith("."),
+                            path="/", path_specified=True,
+                            secure=True,  # HTTPSのみに送信
+                            expires=None, discard=False,
+                            comment=None, comment_url=None, rest={}, rfc2109=False
+                        )
+                        try:
+                            jar.set_cookie(dup)
+                            log.debug("duplicated cookie %s for %s", name, dom)
+                        except Exception as e:
+                            log.debug("failed to set duplicated %s for %s: %s", name, dom, e)
+
+            # ★ポイント：auth だけでなく twoFactorAuth も複製
+            ensure_cookie("auth")
+            ensure_cookie("authtoken")     # 互換名も拾う
+            ensure_cookie("twoFactorAuth")  # これが無いと毎回OTPになる
+        except Exception as e:
+            log.debug("cookie domain duplication failed: %s", e)
+        # 有効性検証
+        self._auth = authentication_api.AuthenticationApi(self._api)
+        try:
+            me = self._auth.get_current_user()  # type: ignore[union-attr]
+            log.info("クッキー再開ログイン成功: %s", getattr(me, "display_name", "me"))
+            self._finalize_auth()
+            return True
+        except Exception as e:
+            log.info("Cookie resume failed; fallback to normal login: %s", e)
+            return False
+
+    def save_cookies(self, path: str) -> bool:
+        jar = _get_cookie_jar(self._api)
+        if not jar:
+            return False
+        data = []
+        for c in jar:
+            try:
+                data.append(_cookie_to_dict(c))
+            except Exception:
+                # 保険: 個々のcookie変換で失敗しても続ける
+                continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"cookies": data, "ts": int(time.time())}, f)
+        # 保存後に auth を含むかチェック（auth or authtoken）
+        has_auth = any((c.get("name", "").lower() in (
+            "auth", "authtoken") and c.get("value")) for c in data)
+        log.info("Saved session cookies: %s (count=%d, has_auth=%s)", path, len(data), has_auth)
+        return True
+
+    def clear_cookie_file(self, path: str) -> None:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                log.info("Cleared cookie file: %s", path)
+        except Exception:
+            pass
